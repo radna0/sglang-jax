@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel import common
 
@@ -169,6 +170,7 @@ def make_group_metadata(
         jnp.arange(num_groups, dtype=jnp.int32),
         group_tiles,
         total_repeat_length=tiles_m + num_groups - 1,
+        out_sharding=P(None),
     )
 
     # Assign an m-dimension tile id to each grid index.
@@ -207,6 +209,7 @@ def make_group_metadata(
         jnp.arange(tiles_m, dtype=jnp.int32),
         tile_visits.astype(jnp.int32),
         total_repeat_length=tiles_m + num_groups - 1,
+        out_sharding=P(None),
     )
 
     # Account for sharding.

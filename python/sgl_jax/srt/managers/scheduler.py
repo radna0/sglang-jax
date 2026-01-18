@@ -245,13 +245,21 @@ class Scheduler(
         )
 
         # launch draft worker
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            if self.spec_algorithm.is_eagle():
+                from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
 
-            self.draft_worker = EAGLEWorker(
-                server_args=server_args,
-                target_worker=self.tp_worker,
-            )
+                self.draft_worker = EAGLEWorker(
+                    server_args=server_args,
+                    target_worker=self.tp_worker,
+                )
+            elif self.spec_algorithm.is_dflash():
+                from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
+
+                self.draft_worker = DFlashWorker(
+                    server_args=server_args,
+                    target_worker=self.tp_worker,
+                )
 
         # Get token and memory info from the model worker
         (

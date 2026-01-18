@@ -54,6 +54,7 @@ from sgl_jax.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
     from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -568,7 +569,7 @@ class ScheduleBatch:
     cache_miss_count: int = 0
 
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+    spec_info: EagleDraftInput | EagleVerifyInput | DFlashDraftInput | DFlashVerifyInput | None = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1720,7 +1721,7 @@ class ModelWorkerBatch:
     # Pre-initialized ForwardBatch for overlap scheduling optimization
     forward_batch: Any | None = None
 
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+    spec_info: EagleDraftInput | EagleVerifyInput | DFlashDraftInput | DFlashVerifyInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     speculative_num_steps: int = 0
     speculative_eagle_topk: int = 0

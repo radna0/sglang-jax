@@ -142,6 +142,7 @@ class ServerArgs:
     speculative_num_steps: int = 4
     speculative_eagle_topk: int = 5
     speculative_num_draft_tokens: int = 4
+    speculative_dflash_block_size: int | None = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
 
@@ -830,7 +831,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -866,6 +867,12 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dflash-block-size",
+            type=int,
+            default=ServerArgs.speculative_dflash_block_size,
+            help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
@@ -1026,6 +1033,22 @@ class ServerArgs:
                 "Speculative decoding does not support overlap scheduler. "
                 "Please pass --disable-overlap-schedule when using --speculative-algorithm."
             )
+
+        if self.speculative_algorithm is not None and self.speculative_algorithm.upper() == "DFLASH":
+            if self.speculative_dflash_block_size is not None:
+                self.speculative_num_draft_tokens = int(self.speculative_dflash_block_size)
+
+            if self.speculative_num_draft_tokens <= 0:
+                raise ValueError("DFLASH requires --speculative-num-draft-tokens > 0.")
+
+            # DFLASH spec-v1 is greedy-only.
+            self.speculative_num_steps = 1
+            self.speculative_eagle_topk = 1
+
+            if self.page_size != 1:
+                raise ValueError("DFLASH currently requires --page-size 1.")
+            if self.speculative_draft_model_path is None:
+                raise ValueError("DFLASH requires --speculative-draft-model-path.")
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

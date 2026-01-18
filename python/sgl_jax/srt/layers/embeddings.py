@@ -204,9 +204,7 @@ class RotaryEmbedding:
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-
-        inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
-        self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
+        self._inv_freq_np = self._compute_inv_freq_np(base)  # shape: (rotary_dim // 2,)
 
     def __call__(
         self,
@@ -241,12 +239,10 @@ class RotaryEmbedding:
 
         return query, key
 
-    def _compute_inv_freq(self, base: int | float) -> jax.Array:
-        """Compute the inverse frequency."""
-        inv_freq = 1.0 / (
-            base ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
-        )
-        return inv_freq
+    def _compute_inv_freq_np(self, base: int | float) -> np.ndarray:
+        base = float(base)
+        inv_freq = 1.0 / (base ** (np.arange(0, self.rotary_dim, 2, dtype=np.float32) / self.rotary_dim))
+        return inv_freq.astype(np.float32)
 
     def _compute_cos_sin_cache(self) -> jax.Array:
         """Compute the cos and sin cache."""
@@ -278,8 +274,8 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         self.orig_max_position = orig_max_position
         super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
 
-    def _compute_inv_freq(self, base: int | float) -> jax.Array:
-        inv_freqs = super()._compute_inv_freq(base)
+    def _compute_inv_freq_np(self, base: int | float) -> np.ndarray:
+        inv_freqs = super()._compute_inv_freq_np(base)
         low_freq_wavelen = self.orig_max_position / self.low_freq_factor
         high_freq_wavelen = self.orig_max_position / self.high_freq_factor
 
@@ -290,16 +286,102 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
             )
         else:
             smooth = 0
-        new_freqs = jnp.where(
+        new_freqs = np.where(
             wave_len < high_freq_wavelen,
             inv_freqs,
-            jnp.where(
+            np.where(
                 wave_len > low_freq_wavelen,
                 inv_freqs / self.scaling_factor,
                 (1 - smooth) * inv_freqs / self.scaling_factor + smooth * inv_freqs,
             ),
         )
-        return new_freqs
+        return new_freqs.astype(np.float32)
+
+
+class YaRNRotaryEmbedding(RotaryEmbedding):
+    """YaRN RoPE scaling (HuggingFace-compatible).
+
+    Applies YaRN-adjusted inverse frequencies and an attention_factor scaling on
+    the computed cos/sin values (see `transformers.modeling_rope_utils`).
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: jnp.dtype,
+        *,
+        scaling_factor: float,
+        beta_fast: float,
+        beta_slow: float,
+        original_max_position: int,
+        truncate: bool,
+        attention_factor: float | None = None,
+        mscale: float | None = None,
+        mscale_all_dim: float | None = None,
+    ) -> None:
+        self.scaling_factor = float(scaling_factor)
+        self.beta_fast = float(beta_fast)
+        self.beta_slow = float(beta_slow)
+        self.original_max_position = int(original_max_position)
+        self.truncate = bool(truncate)
+
+        if attention_factor is None:
+            if mscale is not None and mscale_all_dim is not None:
+                attention_factor = float(
+                    _yarn_get_mscale(self.scaling_factor, float(mscale))
+                    / _yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
+                )
+            else:
+                attention_factor = _yarn_get_mscale(self.scaling_factor, 1.0)
+
+        self.attention_factor = float(attention_factor)
+        super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
+
+    def __call__(
+        self,
+        positions: jax.Array,
+        query: jax.Array,
+        key: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        positions = positions.flatten()  # [num_tokens]
+
+        inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
+
+        freqs = jnp.einsum("n,d->nd", positions.astype(jnp.float32), inv_freq)
+        cos = (jnp.cos(freqs) * self.attention_factor).astype(self.dtype)
+        sin = (jnp.sin(freqs) * self.attention_factor).astype(self.dtype)
+
+        query_shape = query.shape
+        num_tokens = positions.shape[0]
+        query = query.reshape(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.reshape(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+
+        return query, key
+
+    def _compute_inv_freq_np(self, base: int | float) -> np.ndarray:
+        return compute_yarn_inv_frequencies(
+            base=float(base),
+            rotary_dim=int(self.rotary_dim),
+            beta_fast=float(self.beta_fast),
+            beta_slow=float(self.beta_slow),
+            max_position_embeddings=int(self.original_max_position),
+            scaling_factor=float(self.scaling_factor),
+            truncate=bool(self.truncate),
+        )
 
 
 # @partial(jax.jit, static_argnames=["rotary_dim", "head_size", "is_neox_style"])
@@ -442,24 +524,50 @@ def get_rope(
                 high_freq_factor,
                 original_max_position,
             )
+        elif scaling_type == "yarn":
+            scaling_factor = float(rope_scaling["factor"])
+            beta_fast = float(rope_scaling.get("beta_fast") or 32)
+            beta_slow = float(rope_scaling.get("beta_slow") or 1)
+            original_max_position = int(
+                rope_scaling.get("original_max_position_embeddings") or max_position
+            )
+            truncate = bool(rope_scaling.get("truncate", True))
+            attention_factor = rope_scaling.get("attention_factor")
+            mscale = rope_scaling.get("mscale")
+            mscale_all_dim = rope_scaling.get("mscale_all_dim")
+            rotary_emb = YaRNRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                scaling_factor=scaling_factor,
+                beta_fast=beta_fast,
+                beta_slow=beta_slow,
+                original_max_position=original_max_position,
+                truncate=truncate,
+                attention_factor=attention_factor,
+                mscale=mscale,
+                mscale_all_dim=mscale_all_dim,
+            )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
 
 
-def _yarn_get_mscale(scaling_factor: float) -> float:
-    # Approximate magnitude scaling correction used by YaRN
-    if scaling_factor <= 1:
+def _yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
+    if scale <= 1:
         return 1.0
-    return math.sqrt(scaling_factor)
+    return 0.1 * float(mscale) * math.log(float(scale)) + 1.0
 
 
 # Inverse dim formula to find dim based on number of rotations
 def _yarn_find_correction_dim(
-    num_rotations: int,
+    num_rotations: float,
     dim: int,
-    base: float = 10000,
+    base: float = 10000.0,
     max_position_embeddings: int = 2048,
 ) -> float:
     return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
@@ -468,12 +576,49 @@ def _yarn_find_correction_dim(
 
 
 def _yarn_find_correction_range(
-    low_rot: int,
-    high_rot: int,
+    low_rot: float,
+    high_rot: float,
     dim: int,
-    base: int,
+    base: float,
     max_position_embeddings: int,
+    truncate: bool,
 ) -> tuple[float, float]:
-    low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
-    high = math.ceil(_yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
-    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+    low = _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    high = _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
+    return max(low, 0), min(high, dim - 1)
+
+
+def _yarn_linear_ramp_factor(low: float, high: float, dim: int) -> np.ndarray:
+    if low == high:
+        high += 0.001
+    linear = (np.arange(dim, dtype=np.float32) - float(low)) / float(high - low)
+    return np.clip(linear, 0.0, 1.0)
+
+
+def compute_yarn_inv_frequencies(
+    *,
+    base: float,
+    rotary_dim: int,
+    beta_fast: float,
+    beta_slow: float,
+    max_position_embeddings: int,
+    scaling_factor: float,
+    truncate: bool,
+) -> np.ndarray:
+    pos_freqs = base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / float(rotary_dim))
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (float(scaling_factor) * pos_freqs)
+    low, high = _yarn_find_correction_range(
+        low_rot=float(beta_fast),
+        high_rot=float(beta_slow),
+        dim=int(rotary_dim),
+        base=float(base),
+        max_position_embeddings=int(max_position_embeddings),
+        truncate=bool(truncate),
+    )
+    inv_freq_extrapolation_factor = 1.0 - _yarn_linear_ramp_factor(low, high, rotary_dim // 2)
+    inv_freq = inv_freq_interpolation * (1.0 - inv_freq_extrapolation_factor) + inv_freq_extrapolation * inv_freq_extrapolation_factor
+    return inv_freq.astype(np.float32)

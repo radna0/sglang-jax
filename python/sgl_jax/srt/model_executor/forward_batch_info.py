@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 from jax.sharding import NamedSharding, PartitionSpec
@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 
 
 class ForwardMode(IntEnum):
@@ -168,7 +169,9 @@ class ForwardBatch:
     trace_request_ids: list[str] | None = None
     trace_request_objects: list | None = None
 
-    spec_info: EagleVerifyInput | EagleDraftInput | None = None
+    # Keep this as Any at runtime to avoid circular imports between speculative
+    # utilities (which import ScheduleBatch) and ForwardBatch definitions.
+    spec_info: Any | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 

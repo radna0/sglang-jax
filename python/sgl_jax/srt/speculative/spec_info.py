@@ -12,6 +12,7 @@ class SpeculativeAlgorithm(IntEnum):
     NONE = auto()
     EAGLE = auto()
     EAGLE3 = auto()
+    DFLASH = auto()
     STANDALONE = auto()
 
     def is_none(self):
@@ -23,6 +24,9 @@ class SpeculativeAlgorithm(IntEnum):
     def is_eagle3(self):
         return self == SpeculativeAlgorithm.EAGLE3
 
+    def is_dflash(self):
+        return self == SpeculativeAlgorithm.DFLASH
+
     def is_standalone(self):
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -31,6 +35,7 @@ class SpeculativeAlgorithm(IntEnum):
         name_map = {
             "EAGLE": SpeculativeAlgorithm.EAGLE,
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
+            "DFLASH": SpeculativeAlgorithm.DFLASH,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
             None: SpeculativeAlgorithm.NONE,
         }

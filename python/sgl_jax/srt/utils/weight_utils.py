@@ -1064,6 +1064,19 @@ class WeightLoader:
     ) -> jax.Array:
         if mesh is None:
             mesh = self.mesh
+
+        # Support MoE tensors that use an "expert" axis even when the main mesh is
+        # only ("data", "tensor"). We construct an (expert, tensor) mesh with
+        # expert axis size == ep_size (often 1) to match EPMoE sharding patterns.
+        if sharding_spec and "expert" in sharding_spec and ("expert" not in mesh.axis_names):
+            ep_size = int(getattr(self.model_config, "ep_size", 1) or 1)
+            world_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+            if world_size % ep_size != 0:
+                raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")
+            tp_size = world_size // ep_size
+            devices = mesh.devices.flatten()
+            mesh = jax.sharding.Mesh(devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor"))
+
         target_sharding = jax.sharding.NamedSharding(mesh, P(*sharding_spec))
         # Since 'weight' is already a Lazy JAX Array (backed by a callback),
         # using device_put here is necessary when we are NOT using the "Global Loading"

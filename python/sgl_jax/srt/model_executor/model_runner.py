@@ -417,6 +417,12 @@ class ModelRunner:
 
         # Create KV cache pool
         if self.is_hybrid:
+            # FlashAttention's ragged paged attention kernel requires the KV cache
+            # head_dim to be padded/aligned to 128 (even when the model head_dim
+            # is smaller, e.g. GPT-OSS head_dim=64). Non-hybrid MHA cache already
+            # does this padding; keep hybrid consistent to avoid kernel shape
+            # validation failures.
+            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
@@ -424,7 +430,7 @@ class ModelRunner:
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=self.model_config.head_dim,
+                head_dim=head_dim_aligned,
                 mesh=self.mesh,
             )
         else:

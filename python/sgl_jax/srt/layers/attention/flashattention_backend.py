@@ -443,8 +443,12 @@ class FlashAttention(AttentionBackend):
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
         num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
+        kv_heads2 = kv_cache_fused.shape[1]
+        kv_head_dim = kv_cache_fused.shape[2]
+        kv_cache_fused_paged = jax.lax.reshape(
+            kv_cache_fused,
+            (num_pages, self.page_size, kv_heads2, kv_head_dim),
+            out_sharding=NamedSharding(self.mesh, P(None, None, self.kv_partition_axis, None)),
         )
 
         causal = 1
