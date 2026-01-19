@@ -129,6 +129,27 @@ class DFlashWorker(ModelWorker):
 
         self.mask_token_id = resolve_dflash_mask_token_id(draft_hf_config=draft_hf_cfg)
 
+        if os.environ.get("SGLANG_DFLASH_VERBOSE", "0").lower() in ("1", "true", "yes", "y", "on"):
+            try:
+                cfg = getattr(draft_hf_cfg, "dflash_config", None)
+                cfg_dict = dict(cfg) if cfg is not None and not isinstance(cfg, dict) else (cfg or {})
+            except Exception:
+                cfg_dict = {}
+            logger.info(
+                "[DFLASH] init: block_size=%s target_hidden_size=%s K=%s mask_token_id=%s",
+                int(self.block_size),
+                int(self.target_hidden_size),
+                int(self.num_context_features),
+                int(self.mask_token_id),
+            )
+            logger.info(
+                "[DFLASH] init: target_layer_ids=%s draft_model_path=%s",
+                list(target_layer_ids),
+                getattr(server_args, "speculative_draft_model_path", None),
+            )
+            if cfg_dict:
+                logger.info("[DFLASH] init: draft.dflash_config=%s", cfg_dict)
+
         # Draft-side KV bookkeeping uses a separate req_to_token table keyed by the SAME
         # req_pool_idx values as the target scheduler, but mapping into the draft KV pool.
         target_req_to_token = self.target_worker.model_runner.req_to_token_pool.req_to_token
@@ -161,6 +182,7 @@ class DFlashWorker(ModelWorker):
         start = time.perf_counter()
         bs_max = int(self.precompile_bs_paddings[-1])
         cache_loc_pad = int(self.precompile_cache_loc_paddings[-1])
+        max_req_len = int(self.max_req_len)
         logger.info(
             "[DFLASH_SPEC_EXTEND] Precompile bs=%s token_paddings=%s cache_loc_pad=%s",
             bs_max,
@@ -170,6 +192,11 @@ class DFlashWorker(ModelWorker):
         for num_tokens in self.precompile_token_paddings:
             num_tokens = int(num_tokens)
             if bs_max > num_tokens:
+                continue
+            # Never precompile shapes that exceed the engine's configured maximum
+            # request length. Doing so overflows the per-request req_to_token
+            # tables (and can trigger very large TPU compilations).
+            if num_tokens > max_req_len:
                 continue
             batch = self.generate_model_worker_batch(
                 bs_max,
@@ -881,6 +908,28 @@ class DFlashWorker(ModelWorker):
             toks = np.concatenate([candidates[i, 1 : 1 + a], bonus[i : i + 1]], axis=0)
             flat_next[i, : toks.shape[0]] = toks
             accept_lens_out[i] = int(toks.shape[0])
+
+        debug_accept = os.environ.get("SGLANG_DFLASH_DEBUG_ACCEPT", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
+        if debug_accept or profile:
+            # `accept_len` excludes the bonus token; `accept_lens_out` includes it.
+            mean_a = float(np.mean(accept_len)) if bs else 0.0
+            mean_out = float(np.mean(accept_lens_out)) if bs else 0.0
+            p50 = float(np.quantile(accept_len, 0.5)) if bs else 0.0
+            p90 = float(np.quantile(accept_len, 0.9)) if bs else 0.0
+            logger.info(
+                "[DFLASH accept] bs=%d block=%d accept_len(mean=%.3f p50=%.1f p90=%.1f) out_tokens(mean=%.3f)",
+                bs,
+                int(self.block_size),
+                mean_a,
+                p50,
+                p90,
+                mean_out,
+            )
 
         if profile:
             # Note: this includes any implicit JAX compilation triggered in these regions.

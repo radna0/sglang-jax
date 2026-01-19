@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import threading
 import time
 
 import numpy as np
@@ -58,6 +59,7 @@ class BenchArgs:
     skip_warmup: bool = False
     do_not_exit: bool = False
     prompt_suffix: str = ""
+    monitor_interval_s: float = 0.0
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -179,6 +181,12 @@ class BenchArgs:
             default="",
             help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
         )
+        parser.add_argument(
+            "--monitor-interval-s",
+            type=float,
+            default=0.0,
+            help="If >0, periodically prints Engine server_info while generate() is running (debug/monitoring).",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -193,6 +201,7 @@ def throughput_test_once(
     ignore_eos: bool,
     extra_request_body: dict,
     profile: bool,
+    monitor_interval_s: float = 0.0,
 ):
     measurement_results = {
         "backend": backend_name,
@@ -222,9 +231,58 @@ def throughput_test_once(
         os.makedirs(os.environ["SGLANG_JAX_PROFILER_DIR"], exist_ok=True)
         backend.start_profile()
 
+    stop_evt = threading.Event()
+
+    def _monitor_loop():
+        interval = float(monitor_interval_s)
+        if interval <= 0:
+            return
+        warned = False
+        while not stop_evt.is_set():
+            time.sleep(interval)
+            try:
+                info = backend.get_server_info()
+                if inspect.isawaitable(info):
+                    info = asyncio.run(info)
+                st = (info or {}).get("internal_states", None)
+                if isinstance(st, list) and st:
+                    st0 = st[0]
+                    last = st0.get("last_gen_throughput")
+                    spec = st0.get("speculative_stats")
+                    if isinstance(spec, dict):
+                        logging.info(
+                            "[monitor] last_gen_throughput=%s spec=%s",
+                            last,
+                            {
+                                "algo": spec.get("algorithm"),
+                                "accept_ratio": spec.get("accept_ratio"),
+                                "accept_len": spec.get("accept_len"),
+                                "accept_token": spec.get("accept_token"),
+                                "draft_token": spec.get("draft_token"),
+                            },
+                        )
+                    else:
+                        logging.info("[monitor] last_gen_throughput=%s", last)
+            except Exception:
+                # Monitoring must never crash the benchmark run.
+                if not warned:
+                    warned = True
+                    logging.warning("[monitor] get_server_info failed (suppressing further errors).")
+                continue
+
+    monitor_thread = None
+    if float(monitor_interval_s) > 0:
+        monitor_thread = threading.Thread(target=_monitor_loop, daemon=True)
+        monitor_thread.start()
+
     st = time.perf_counter()
-    gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
-    latency = time.perf_counter() - st
+    try:
+        gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+        latency = time.perf_counter() - st
+    finally:
+        stop_evt.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=1.0)
 
     if profile:
         dir = os.getenv("SGLANG_JAX_PROFILER_DIR")
@@ -346,6 +404,7 @@ def throughput_test(
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
             profile=False,
+            monitor_interval_s=0.0,
         )
         time.sleep(0.5)
 
@@ -357,6 +416,7 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
+        monitor_interval_s=float(bench_args.monitor_interval_s),
     )
     backend.shutdown()
 

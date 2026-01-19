@@ -890,16 +890,25 @@ def sample_random_requests(
     return_text: bool = True,
     max_retry: int = 10,
 ) -> list[DatasetRow]:
-    input_lens = np.random.randint(
-        max(int(input_len * range_ratio), 1),
-        input_len + 1,
-        size=num_prompts,
-    )
-    output_lens = np.random.randint(
-        int(output_len * range_ratio),
-        output_len + 1,
-        size=num_prompts,
-    )
+    # NOTE: For throughput benchmarking (especially speculative decoding),
+    # variable prompt/output lengths cause the number of active requests (bs) to
+    # change frequently, which can trigger costly JAX recompiles and makes
+    # comparisons noisy. When range_ratio==0, interpret it as a request for
+    # fixed-length inputs/outputs.
+    if float(range_ratio) <= 0.0:
+        input_lens = np.full((num_prompts,), int(input_len), dtype=np.int32)
+        output_lens = np.full((num_prompts,), int(output_len), dtype=np.int32)
+    else:
+        input_lens = np.random.randint(
+            max(int(input_len * range_ratio), 1),
+            input_len + 1,
+            size=num_prompts,
+        )
+        output_lens = np.random.randint(
+            max(int(output_len * range_ratio), 1),
+            output_len + 1,
+            size=num_prompts,
+        )
 
     if random_sample:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens

@@ -344,6 +344,22 @@ def gmm(
         raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
 
     tm, tk, tn = tiling
+    # TPU Pallas lowering has strict block-shape constraints:
+    # the last two dims of each block must be divisible by (8, 128) or match the
+    # corresponding full array dimensions. Some tuned tilings (especially small
+    # `tm` for odd `m`, or `tk/tn` for hidden sizes not divisible by 128) can
+    # violate this and crash compilation on GPT-OSS shapes (e.g., hidden_size=2880).
+    #
+    # Coerce the tiling to a safe fallback when needed. This trades some
+    # performance for correctness and unblocks long-context precompile.
+    if (tm % 8) != 0 and tm != m:
+        tm = m
+    if (tk % 8) != 0 and tk != k:
+        tk = k
+    if (tk % 128) != 0 and tk != k:
+        tk = k
+    if (tn % 128) != 0 and tn != n:
+        tn = n
     tiles_k, k_rem = _calculate_irregular_num_tiles(k, tk)
     tiles_n, n_rem = _calculate_irregular_num_tiles(n, tn)
     del n_rem
