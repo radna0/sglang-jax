@@ -150,12 +150,110 @@ class DFlashWorker(ModelWorker):
             )
 
     def run_spec_decode_precompile(self):
-        # Keep precompile lightweight for TPU development. DFLASH has additional
-        # forward modes (prefill w/ hidden capture, draft propose, verify) and
-        # benefits from precompiling fixed-shape kernels, but correctness comes
-        # first. We will add a full precompile suite once DFLASH acceptance is
-        # healthy and we start chasing the 5–6× speed target.
-        return
+        # DFLASH is extremely sensitive to JAX compilation overhead because it
+        # introduces additional forward modes (draft propose + target verify).
+        # Without precompile, each decode batch shape (bs changes as requests
+        # finish) can trigger a fresh compilation, destroying throughput.
+        self._precompile_spec_extend()
+        self._precompile_spec_decode()
+
+    def _precompile_spec_extend(self) -> None:
+        start = time.perf_counter()
+        bs_max = int(self.precompile_bs_paddings[-1])
+        cache_loc_pad = int(self.precompile_cache_loc_paddings[-1])
+        logger.info(
+            "[DFLASH_SPEC_EXTEND] Precompile bs=%s token_paddings=%s cache_loc_pad=%s",
+            bs_max,
+            self.precompile_token_paddings,
+            cache_loc_pad,
+        )
+        for num_tokens in self.precompile_token_paddings:
+            num_tokens = int(num_tokens)
+            if bs_max > num_tokens:
+                continue
+            batch = self.generate_model_worker_batch(
+                bs_max,
+                num_tokens,
+                ForwardMode.EXTEND,
+                cache_loc_pad,
+                do_penalties=False,
+                speculative_algotithm=self.speculative_algorithm,
+            )
+            # Precompile should not request logprobs. The DFLASH worker does not
+            # support logprob outputs yet, and the default ModelWorkerBatch
+            # path can set return_output_logprob_only=True.
+            batch.return_logprob = False
+            batch.return_output_logprob_only = False
+            draft_alloc = self.draft_model_runner.token_to_kv_pool_allocator
+            draft_state = draft_alloc.backup_state()
+            try:
+                self.forward_batch_speculative_generation(batch)
+            finally:
+                draft_alloc.restore_state(draft_state)
+                # Clear draft req->token mapping for the precompile req ids.
+                self._draft_req_to_token[:bs_max, :] = 0
+        logger.info("[DFLASH_SPEC_EXTEND] Done in %.1fs", time.perf_counter() - start)
+
+    def _precompile_spec_decode(self) -> None:
+        start = time.perf_counter()
+        logger.info(
+            "[DFLASH_SPEC_DECODE] Precompile bs_paddings=%s block_size=%s",
+            self.precompile_bs_paddings,
+            int(self.block_size),
+        )
+
+        feat = int(self.num_context_features * self.target_hidden_size)
+        dummy_target_hidden = jnp.empty(
+            (0, feat),
+            dtype=jnp.bfloat16 if str(self.server_args.dtype) == "bfloat16" else jnp.float32,
+        )
+
+        for bs in self.precompile_bs_paddings:
+            bs = int(bs)
+            aligned_cache_loc_size = (
+                (bs * int(self.max_req_len) + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            batch = self.generate_model_worker_batch(
+                bs,
+                bs,
+                ForwardMode.DECODE,
+                aligned_cache_loc_size,
+                do_penalties=False,
+                speculative_algotithm=self.speculative_algorithm,
+            )
+            # Precompile should not request logprobs. The DFLASH worker does not
+            # support logprob outputs yet, and the default ModelWorkerBatch
+            # path can set return_output_logprob_only=True.
+            batch.return_logprob = False
+            batch.return_output_logprob_only = False
+            batch.spec_info = DFlashDraftInput(
+                verified_id=np.ones((bs,), dtype=np.int32),
+                target_hidden=dummy_target_hidden,
+                ctx_lens_cpu=[0] * bs,
+                draft_seq_lens_cpu=[0] * bs,
+            )
+            draft_alloc = self.draft_model_runner.token_to_kv_pool_allocator
+            target_alloc = self.target_worker.model_runner.token_to_kv_pool_allocator
+            draft_state = None
+            target_state = None
+            try:
+                draft_state = draft_alloc.backup_state()
+            except NotImplementedError:
+                draft_state = None
+            try:
+                target_state = target_alloc.backup_state()
+            except NotImplementedError:
+                target_state = None
+            try:
+                self.forward_batch_speculative_generation(batch)
+            finally:
+                if draft_state is not None:
+                    draft_alloc.restore_state(draft_state)
+                if target_state is not None:
+                    target_alloc.restore_state(target_state)
+                self._draft_req_to_token[:bs, :] = 0
+
+        logger.info("[DFLASH_SPEC_DECODE] Done in %.1fs", time.perf_counter() - start)
 
     def _draft_kv_assign(
         self,
@@ -281,6 +379,76 @@ class DFlashWorker(ModelWorker):
         draft_input.target_hidden = draft_input.target_hidden[:0]
         draft_input.ctx_lens_cpu = [0] * bs
         draft_input.draft_seq_lens_cpu = new_draft_seq_lens_cpu
+
+    def _append_target_hidden_block_to_draft_kv(
+        self,
+        *,
+        req_pool_indices: np.ndarray,
+        kv_seq_lens: np.ndarray,
+        commit_lens: np.ndarray,
+        target_hidden_block: jax.Array,
+    ) -> None:
+        """Commit a fixed-size (bs×block_size) verify block into the draft KV cache.
+
+        This is the TPU decode fast-path. It avoids dynamic shapes from
+        `sum(commit_lens)` by always materializing K/V for the full verify block
+        and masking out uncommitted positions (KV index 0).
+        """
+        bs = int(len(req_pool_indices))
+        if bs == 0:
+            return
+
+        block = int(self.block_size)
+        if int(getattr(target_hidden_block, "shape", (0,))[0]) != bs * block:
+            raise RuntimeError(
+                "DFLASH target_hidden_block shape mismatch: "
+                f"target_hidden_block.shape[0]={int(target_hidden_block.shape[0])} expected={bs * block}"
+            )
+
+        # Allocate draft KV slots for the whole block, then free uncommitted slots.
+        alloc = self.draft_model_runner.token_to_kv_pool_allocator
+        block_cache_loc = alloc.alloc(bs * block)
+        if block_cache_loc is None:
+            raise RuntimeError(f"DFLASH draft OOM allocating commit block: bs={bs} block={block}.")
+        block_cache_loc = np.asarray(block_cache_loc, dtype=np.int32).reshape(bs, block)
+
+        positions = (
+            kv_seq_lens.reshape(bs, 1) + np.arange(block, dtype=np.int32).reshape(1, block)
+        ).astype(np.int32)
+
+        masked_cache_loc = block_cache_loc.copy()
+        for i in range(bs):
+            keep = int(commit_lens[i])
+            if keep < 0 or keep > block:
+                raise RuntimeError(f"DFLASH invalid commit_len={keep} (block={block})")
+            if keep < block:
+                alloc.free(block_cache_loc[i, keep:])
+                masked_cache_loc[i, keep:] = 0
+
+        # Update req->token mapping for committed tokens only.
+        for i in range(bs):
+            keep = int(commit_lens[i])
+            if keep <= 0:
+                continue
+            req_pool_idx = int(req_pool_indices[i])
+            start = int(kv_seq_lens[i])
+            self._draft_req_to_token[req_pool_idx, start : start + keep] = block_cache_loc[i, :keep]
+
+        # Project target hidden features down to the draft hidden size, then materialize K/V per draft layer.
+        ctx_hidden = self.draft_model_runner.model.project_target_hidden(target_hidden_block)
+        ctx_positions_dev = jax.device_put(jnp.asarray(positions.reshape(-1), dtype=jnp.int32))
+        ctx_cache_loc_dev = jax.device_put(jnp.asarray(masked_cache_loc.reshape(-1), dtype=jnp.int32))
+
+        for layer in self.draft_model_runner.model.layers:
+            k, v = layer.self_attn.kv_proj_only(hidden_states=ctx_hidden)
+            k = layer.self_attn.apply_k_rope(positions=ctx_positions_dev, k=k)
+            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+                int(layer.layer_id),
+                ctx_cache_loc_dev,
+                k,
+                v,
+                is_decode=True,
+            )
 
     def _draft_block_propose(
         self,
@@ -429,6 +597,21 @@ class DFlashWorker(ModelWorker):
                 if model_worker_batch.extend_prefix_lens is not None
                 else [0] * model_worker_batch.real_bs
             )
+            # During JAX precompile we may use dummy batches where extend_seq_lens
+            # does not reflect the true packed hidden_states layout. In that
+            # case, fall back to a deterministic "packed-into-first-request"
+            # convention so KV materialization can still compile without
+            # requiring real prompt semantics.
+            try:
+                hs_rows = int(logits_output.hidden_states.shape[0])
+                total_ctx = int(sum(int(x) for x in ctx_lens_cpu[: model_worker_batch.real_bs]))
+                if hs_rows != total_ctx:
+                    ctx_lens_cpu = [hs_rows] + [0] * max(int(model_worker_batch.real_bs) - 1, 0)
+                    draft_seq_lens_cpu = [int(draft_seq_lens_cpu[0]) if draft_seq_lens_cpu else 0] + [0] * max(
+                        int(model_worker_batch.real_bs) - 1, 0
+                    )
+            except Exception:
+                pass
             draft_input = DFlashDraftInput(
                 verified_id=next_token_ids,
                 target_hidden=logits_output.hidden_states,
@@ -501,10 +684,17 @@ class DFlashWorker(ModelWorker):
 
         # ---- target verify (prefill-style) over the full block
         block = int(self.block_size)
-        allocator = model_worker_batch.tree_cache.token_to_kv_pool_allocator
-        req_to_token = model_worker_batch.tree_cache.req_to_token_pool.req_to_token
+        tree_cache = getattr(model_worker_batch, "tree_cache", None)
+        if tree_cache is not None:
+            allocator = tree_cache.token_to_kv_pool_allocator
+            req_to_token = tree_cache.req_to_token_pool.req_to_token
+        else:
+            allocator = self.target_worker.model_runner.token_to_kv_pool_allocator
+            req_to_token = self.target_worker.model_runner.req_to_token_pool.req_to_token
 
-        out_cache_loc = alloc_token_slots(model_worker_batch.tree_cache, bs * block)
+        out_cache_loc = allocator.alloc(bs * block)
+        if out_cache_loc is None:
+            raise RuntimeError(f"DFLASH target OOM allocating verify block: bs={bs} block={block}")
         out_cache_loc = np.asarray(out_cache_loc, dtype=np.int32)
 
         for i, req_pool_idx in enumerate(req_pool_indices.tolist()):
@@ -593,12 +783,6 @@ class DFlashWorker(ModelWorker):
         commit_lens = np.asarray(jax.device_get(commit_lens_jax), dtype=np.int32).reshape(bs)
         bonus = np.asarray(jax.device_get(bonus_jax), dtype=np.int32).reshape(bs)
 
-        commit_hidden = verify_input.extract_commit_target_hidden(
-            batch_size=bs,
-            logits_output=logits_output,
-            commit_lens=commit_lens_jax,
-        )
-
         # Free uncommitted verify KV slots: keep first commit_len tokens per request.
         for i in range(bs):
             s = i * block
@@ -670,9 +854,23 @@ class DFlashWorker(ModelWorker):
             ).reshape(bs)
 
         # Update draft state: commit (current + accepted) into draft KV, and set new current to bonus.
-        draft_input.target_hidden = commit_hidden
-        draft_input.ctx_lens_cpu = [int(x) for x in commit_lens.tolist()]
-        self._append_target_hidden_to_draft_kv(req_pool_indices=req_pool_indices, draft_input=draft_input)
+        #
+        # On TPU, using a variable-sized commit buffer (`sum(commit_lens)`) causes
+        # recompiles and kills throughput. Materialize the full verify block with
+        # a fixed shape (bs×block) and mask out uncommitted positions instead.
+        self._append_target_hidden_block_to_draft_kv(
+            req_pool_indices=req_pool_indices,
+            kv_seq_lens=kv_seq_lens,
+            commit_lens=commit_lens,
+            target_hidden_block=logits_output.hidden_states,
+        )
+        # Keep draft-side KV length bookkeeping in sync with the target.
+        if draft_input.draft_seq_lens_cpu is not None:
+            draft_input.draft_seq_lens_cpu = [
+                int(kv_seq_lens[i]) + int(commit_lens[i]) for i in range(bs)
+            ]
+        draft_input.ctx_lens_cpu = [0] * bs
+        draft_input.target_hidden = draft_input.target_hidden[:0] if draft_input.target_hidden is not None else None
         draft_input.verified_id = bonus.astype(np.int32)
 
         # Output tokens to append this step: accepted drafts + bonus, padded to `block` stride.
@@ -698,6 +896,9 @@ class DFlashWorker(ModelWorker):
 
         return GenerationBatchResult(
             logits_output=None,
+            # Keep a flat, padded [bs * block] list here; the scheduler resolves
+            # per-request accepted tokens via `accept_lens` (see
+            # SchedulerOutputProcessorMixin._resolve_spec_decode_token_ids).
             next_token_ids=flat_next.reshape(-1),
             next_draft_input=draft_input,
             accept_lens=accept_lens_out.astype(np.int32),

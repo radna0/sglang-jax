@@ -263,7 +263,15 @@ class SchedulerOutputProcessorMixin:
 
             new_accepted_len = 1
             if batch.spec_algorithm is None or batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
+                # Defensive: speculative workers (DFLASH/EAGLE) return a per-request
+                # list of accepted tokens. If batch.spec_algorithm is unexpectedly
+                # unset, treat list outputs as "extend" to avoid nesting lists
+                # inside output_ids (which breaks finish checks).
+                if isinstance(next_token_id, list):
+                    req.output_ids.extend(next_token_id)
+                    new_accepted_len = len(next_token_id)
+                else:
+                    req.output_ids.append(next_token_id)
             elif self.spec_algorithm.is_eagle():
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)

@@ -429,10 +429,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
-        raise NotImplementedError
+        # Used by speculative decoding precompile to avoid leaking KV pages.
+        return (
+            self.full_attn_allocator.backup_state(),
+            self.swa_attn_allocator.backup_state(),
+            self.full_to_swa_index_mapping.copy(),
+            bool(self.is_not_in_free_group),
+            list(self.free_group),
+        )
 
     def restore_state(self, state):
-        raise NotImplementedError
+        full_state, swa_state, mapping, is_not_in_free_group, free_group = state
+        self.full_attn_allocator.restore_state(full_state)
+        self.swa_attn_allocator.restore_state(swa_state)
+        self.full_to_swa_index_mapping[...] = mapping
+        self.is_not_in_free_group = bool(is_not_in_free_group)
+        self.free_group = list(free_group)
 
     def clear(self):
         self.swa_attn_allocator.clear()

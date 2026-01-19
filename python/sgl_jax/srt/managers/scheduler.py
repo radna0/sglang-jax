@@ -1352,6 +1352,19 @@ class Scheduler(
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids
 
+        def _coerce_token_ids_to_py_list(x: Any) -> list[Any] | None:
+            if x is None:
+                return None
+            if isinstance(x, list):
+                return x
+            tolist = getattr(x, "tolist", None)
+            if callable(tolist):
+                return tolist()
+            try:
+                return list(x)
+            except Exception:
+                return None
+
         # These 2 values are needed for processing the output, but the values can be
         # modified by overlap schedule. So we have to copy them here so that
         # we can use the correct values in output processing.
@@ -1366,7 +1379,7 @@ class Scheduler(
 
         ret = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids.tolist(),
+            next_token_ids=_coerce_token_ids_to_py_list(next_token_ids),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
