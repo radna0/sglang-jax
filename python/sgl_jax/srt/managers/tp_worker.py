@@ -12,6 +12,7 @@ import numpy as np
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
 from tqdm import tqdm
+from transformers import AutoConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
@@ -34,6 +35,7 @@ from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
 )
+from sgl_jax.srt.speculative.dflash_utils import resolve_dflash_target_layer_ids
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,35 @@ class ModelWorker:
             req_to_token_pool=req_to_token_pool,
             rngs=nnx.Rngs(self.random_seed),
         )
+
+        # DFLASH requires the target model to capture intermediate features from
+        # multiple layers (K context features) during prefill/verify. The
+        # scheduler constructs `DFlashWorker`, but the actual model forward runs
+        # inside this TP worker process, so we must configure the model here.
+        if (not is_draft_worker) and self.speculative_algorithm.is_dflash():
+            try:
+                logger.info(
+                    "DFLASH target init: speculative_draft_model_path=%s",
+                    server_args.speculative_draft_model_path,
+                )
+                draft_cfg = AutoConfig.from_pretrained(
+                    server_args.speculative_draft_model_path,
+                    trust_remote_code=bool(server_args.trust_remote_code),
+                )
+                target_layer_ids = resolve_dflash_target_layer_ids(
+                    draft_hf_config=draft_cfg,
+                    target_num_layers=int(self.model_config.num_hidden_layers),
+                    default_num_context_features=int(getattr(draft_cfg, "num_hidden_layers", 0) or 0) or 4,
+                )
+                if hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+                    self.model_runner.model.set_dflash_layers_to_capture(target_layer_ids)
+                    logger.info("DFLASH target capture layers: %s", target_layer_ids)
+                else:
+                    logger.warning(
+                        "DFLASH enabled but target model has no set_dflash_layers_to_capture; hidden capture will be missing."
+                    )
+            except Exception as e:
+                logger.warning("Failed to configure DFLASH target hidden capture: %s", e)
 
         # set infer devices
         self.device = server_args.device

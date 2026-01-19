@@ -17,7 +17,6 @@ from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import jax
-import uvloop
 import zmq
 import zmq.asyncio
 from flax import nnx
@@ -65,7 +64,13 @@ from sgl_jax.srt.utils import (
 from sgl_jax.version import __version__
 
 logger = logging.getLogger(__name__)
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+try:  # pragma: no cover
+    import uvloop  # type: ignore
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ModuleNotFoundError:
+    # uvloop is an optional speed optimization; SGLang-JAX works without it.
+    pass
 
 
 class Engine(EngineBase):

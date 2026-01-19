@@ -1039,13 +1039,6 @@ class ScheduleBatch:
             self.seq_lens = np.array(self.seq_lens)
             self.output_ids = np.array(self.output_ids)
         self.seq_lens = self.seq_lens[keep_indices]
-        if self.spec_info is not None and self.spec_info.topk_p is not None:
-            keep_indices_jax = jnp.asarray(keep_indices, dtype=jnp.int32)
-            self.spec_info.topk_p = self.spec_info.topk_p[keep_indices_jax]
-            self.spec_info.topk_index = self.spec_info.topk_index[keep_indices_jax]
-            self.spec_info.hidden_states = self.spec_info.hidden_states[keep_indices_jax]
-            self.spec_info.verified_id = self.spec_info.verified_id[keep_indices_jax]
-            self.spec_info.allocate_lens = self.spec_info.allocate_lens[keep_indices_jax]
 
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
@@ -1066,13 +1059,21 @@ class ScheduleBatch:
 
         self.sampling_info.filter_batch(np.array(keep_indices))
         if self.spec_info is not None:
-            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
-                has_been_filtered = False
-            else:
-                has_been_filtered = True
-            self.spec_info.filter_batch(
-                new_indices=keep_indices, has_been_filtered=has_been_filtered
+            keep_indices_arr = np.asarray(keep_indices, dtype=np.int32)
+            # For speculative decoding, some workers already filter the per-request
+            # spec state to the unfinished requests (making indices effectively a
+            # prefix 0..N-1). Others (e.g. DFLASH v1 bring-up) do not.
+            #
+            # Safe rule: if keep_indices is a prefix, allow a fast truncate path;
+            # otherwise, require true indexing to preserve alignment with reqs.
+            is_prefix = bool(
+                keep_indices_arr.shape[0] > 0
+                and np.array_equal(
+                    keep_indices_arr,
+                    np.arange(keep_indices_arr.shape[0], dtype=np.int32),
+                )
             )
+            self.spec_info.filter_batch(new_indices=keep_indices_arr, has_been_filtered=is_prefix)
 
     def merge_batch(self, other: ScheduleBatch):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1416,7 +1417,6 @@ class ScheduleBatch:
         seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
-        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
         # FIXME @pc, move this to eagle_worker
         # If enable spec inference, use positions in spec info firstly
         if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
@@ -1463,15 +1463,31 @@ class ScheduleBatch:
 
         cache_loc_flat = np.array([], dtype=np.int32)
 
-        if len(seq_lens_cpu) > 0:
+        fast_dflash_decode = (
+            self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+            and self.spec_algorithm.is_dflash()
+            and self.forward_mode == ForwardMode.DECODE
+        )
+
+        # DFLASH DECODE is executed entirely inside DFlashWorker:
+        # - it does its own TARGET_VERIFY forwards (and builds its own cache_loc there)
+        # - it does not use `batch.cache_loc`
+        # Avoid building a full-length cache_loc here, which is O(seq_len) per request and
+        # dominates long-context decode regimes.
+        if (not fast_dflash_decode) and len(seq_lens_cpu) > 0:
+            token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
             seq_lens = seq_lens_cpu
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 if self.forward_mode == ForwardMode.TARGET_VERIFY:
                     seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
                 elif self.forward_mode == ForwardMode.DECODE:
-                    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+                    # Only EAGLE uses pre-allocation for multi-step draft tokens.
+                    # DFLASH manages its own per-step allocations in the worker.
+                    if self.spec_algorithm.is_eagle():
+                        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
-                    seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
+                        seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
             # Filter out empty sequences
             valid_mask = seq_lens > 0
             if np.any(valid_mask):

@@ -267,6 +267,9 @@ class SchedulerOutputProcessorMixin:
             elif self.spec_algorithm.is_eagle():
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+            elif self.spec_algorithm.is_dflash():
+                req.output_ids.extend(next_token_id)
+                new_accepted_len = len(next_token_id)
 
             req.check_finished(new_accepted_len)
             if req.finished():

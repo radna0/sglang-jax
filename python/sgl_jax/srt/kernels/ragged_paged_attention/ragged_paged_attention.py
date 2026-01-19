@@ -923,16 +923,18 @@ def _ragged_paged_attention_kernel(
                 def update_cur_bkv_to_cache():
                     start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
-                def load_mask(q_span, k_span):
-                    if bkvmask_ref is None:
-                        return q_span < k_span
-                    else:
-                        # use custom mask
-                        mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
-                        num_q_heads_per_kv_head_mask = jnp.repeat(
-                            mask, num_q_heads_per_kv_head, axis=0
-                        )
-                        return num_q_heads_per_kv_head_mask != 1
+            def load_mask(q_span, k_span):
+                if bkvmask_ref is None:
+                    # Either:
+                    # - `causal == 1`: use implicit causal masking with prefix offset, OR
+                    # - `causal == 0` and `custom_mask is None`: full attention (no mask),
+                    #   handled by setting bkvmask_ref=None above.
+                    return q_span < k_span if causal == 1 else jnp.zeros_like(q_span, dtype=jnp.bool_)
+
+                # use custom mask
+                mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
+                num_q_heads_per_kv_head_mask = jnp.repeat(mask, num_q_heads_per_kv_head, axis=0)
+                return num_q_heads_per_kv_head_mask != 1
 
                 # Flash attention with cur bkv and bq
                 # NOTE: kv_packing is divided by 2 because k and v are packed together.
@@ -1473,6 +1475,8 @@ def ragged_paged_attention(
     pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
 
+    use_custom_mask = custom_mask is not None
+
     bkv_p = num_kv_pages_per_block
     bq_sz = num_queries_per_block
     if bq_sz is None or bkv_p is None:
@@ -1500,7 +1504,7 @@ def ragged_paged_attention(
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     seq_mask_lens = kv_lens * q_lens
     cu_seq_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)])
-    if custom_mask is not None:
+    if use_custom_mask:
         if custom_mask.dtype == jnp.bool_:
             logger.warning(
                 "custom_mask bool dtype detected in ragged_paged_attention; converting to int32 (0:False, 1:True)."
@@ -1519,7 +1523,7 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.ANY),  # q
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_fused
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_cache_fused
-        pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,  # custom_mask
+        pl.BlockSpec(memory_space=pltpu.ANY) if use_custom_mask else None,  # custom_mask
         pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
     ]
 
@@ -1533,8 +1537,9 @@ def ragged_paged_attention(
         kv_cache_fused_processed.dtype,
     )
 
-    if causal == 1:
-        # we don't need bkvmask_double_buf
+    if causal == 1 or not use_custom_mask:
+        # - causal==1 uses the implicit causal mask with prefix offset.
+        # - causal==0 with no custom_mask means "full attention" (no mask).
         bkvmask_double_buf = None
     else:
         bkvmask_double_buf = pltpu.VMEM(

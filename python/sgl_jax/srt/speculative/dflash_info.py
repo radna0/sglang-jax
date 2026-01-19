@@ -122,9 +122,13 @@ class DFlashVerifyInput:
     capture_hidden_mode: "CaptureHiddenMode" | Any = None
 
     def tree_flatten(self):
-        draft_token_num_arr = jnp.asarray(int(self.draft_token_num), dtype=jnp.int32)
-        children = (self.draft_token, self.positions, self.custom_mask, draft_token_num_arr)
-        aux_data = {"capture_hidden_mode": self.capture_hidden_mode}
+        # Keep `draft_token_num` static in aux_data. Converting tracers to Python
+        # ints inside tree_unflatten breaks JIT (ConcretizationTypeError).
+        children = (self.draft_token, self.positions, self.custom_mask)
+        aux_data = {
+            "capture_hidden_mode": self.capture_hidden_mode,
+            "draft_token_num": int(self.draft_token_num),
+        }
         return (children, aux_data)
 
     @classmethod
@@ -134,7 +138,7 @@ class DFlashVerifyInput:
         obj.draft_token = children[0]
         obj.positions = children[1]
         obj.custom_mask = children[2]
-        obj.draft_token_num = int(children[3]) if children[3] is not None else 0
+        obj.draft_token_num = int(aux_data.get("draft_token_num", 0) or 0)
         return obj
 
     def filter_batch(self, new_indices: jax.Array, has_been_filtered: bool = True):

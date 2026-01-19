@@ -14,10 +14,14 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
 )
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.layers.radix_attention import AttentionType
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -172,16 +176,20 @@ class FlashAttention(AttentionBackend):
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            # convert custom_mask from bool to int32, because dma not support bool type
-            if batch.spec_info.custom_mask.dtype == jnp.bool:
-                # FIXME(pc) rm this dtype convert
-                logger.warning(
-                    "batch.spec_info.custom_mask type is  %s, it may make performance very low",
-                    batch.spec_info.custom_mask.dtype,
-                )
-                metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
+            custom_mask = getattr(batch.spec_info, "custom_mask", None) if batch.spec_info else None
+            if custom_mask is None:
+                metadata.custom_mask = None
             else:
-                metadata.custom_mask = batch.spec_info.custom_mask
+                # convert custom_mask from bool to int32, because dma not support bool type
+                if custom_mask.dtype == jnp.bool:
+                    # FIXME(pc) rm this dtype convert
+                    logger.warning(
+                        "batch.spec_info.custom_mask type is  %s, it may make performance very low",
+                        custom_mask.dtype,
+                    )
+                    metadata.custom_mask = custom_mask.astype(jnp.int32)
+                else:
+                    metadata.custom_mask = custom_mask
         else:
             metadata.custom_mask = None
 
@@ -354,6 +362,10 @@ class FlashAttention(AttentionBackend):
         if batch.spec_algorithm.is_none():
             raise RuntimeError("should not reach here")
         else:
+            # Only EAGLE uses this path. Import lazily so that optional /
+            # version-sensitive speculative kernels don't break non-spec runs.
+            from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
             assert isinstance(batch.spec_info, EagleDraftInput)
             # it is same across every step
             cu_q_lens = np.arange(
@@ -451,9 +463,13 @@ class FlashAttention(AttentionBackend):
             out_sharding=NamedSharding(self.mesh, P(None, None, self.kv_partition_axis, None)),
         )
 
-        causal = 1
-
-        # custom_mask = self.forward_metadata.custom_mask
+        # NOTE:
+        # - Standard decoder attention uses `causal=1`.
+        # - TARGET_VERIFY can still be causal, unless a worker provides a custom mask.
+        # - DFLASH draft attention is encoder-only (non-causal). On TPU we want to
+        #   support `causal=0` even when `custom_mask` is None, which the kernel
+        #   interprets as "full attention".
+        causal = 0 if layer.attn_type == AttentionType.ENCODER_ONLY else 1
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it

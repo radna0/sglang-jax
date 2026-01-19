@@ -16,12 +16,11 @@ import uuid
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 import fastapi
 import jax
 import jax.numpy as jnp
-import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
@@ -69,7 +68,13 @@ from sgl_jax.srt.utils import (
 )
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+try:  # pragma: no cover
+    import uvloop  # type: ignore
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ModuleNotFoundError:
+    # Optional speed optimization; works without it.
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -1316,7 +1321,10 @@ class SignalHandler:
         kill_process_tree(os.getpid())
 
 
-class _Communicator[T]:
+T = TypeVar("T")
+
+
+class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
     def __init__(self, sender, fan_out: int):

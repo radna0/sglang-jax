@@ -26,7 +26,6 @@ from contextlib import asynccontextmanager
 import orjson
 import requests
 import uvicorn
-import uvloop
 from fastapi import Depends, FastAPI, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,7 +82,13 @@ from sgl_jax.utils import get_exception_traceback
 from sgl_jax.version import __version__
 
 logger = logging.getLogger(__name__)
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+try:  # pragma: no cover
+    import uvloop  # type: ignore
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    _HAVE_UVLOOP = True
+except ModuleNotFoundError:
+    _HAVE_UVLOOP = False
 
 
 # Store global states
@@ -833,7 +838,7 @@ def launch(
             port=server_args.port,
             log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
-            loop="uvloop",
+            loop="uvloop" if _HAVE_UVLOOP else "asyncio",
         )
     finally:
         warmup_thread.join()

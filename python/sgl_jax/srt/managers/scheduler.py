@@ -12,13 +12,25 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import jax
 import numpy as np
-import pathwaysutils
 import psutil
-import setproctitle
 import zmq
+
+# `pathwaysutils` is only required when running JAX in "proxy" mode (Pathways).
+# Many TPU boxes run with `JAX_PLATFORMS=tpu` and do not have this dependency.
+try:
+    import pathwaysutils  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    pathwaysutils = None
+
+# Cosmetic only; scheduler works without it.
+try:
+    import setproctitle  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    setproctitle = None
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -66,7 +78,8 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+if TYPE_CHECKING:  # pragma: no cover
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -108,7 +121,7 @@ class GenerationBatchResult:
     bid: int
     cache_miss_count: int
     # relay path: forward stream -> next step forward
-    next_draft_input: EagleDraftInput | None = None
+    next_draft_input: Any | None = None
 
     allocate_lens: np.ndarray | None = None
     num_accepted_tokens: int | None = None
@@ -230,6 +243,11 @@ class Scheduler(
 
         platform = os.getenv("JAX_PLATFORMS", None)
         if platform == "proxy":
+            if pathwaysutils is None:
+                raise ModuleNotFoundError(
+                    "JAX_PLATFORMS=proxy requires the optional dependency `pathwaysutils`, "
+                    "but it is not installed."
+                )
             pathwaysutils.initialize()
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, self.tp_size],
@@ -772,6 +790,19 @@ class Scheduler(
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),
         }
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            accept_ratio = (self.accept_token / self.draft_token) if self.draft_token else 0.0
+            accept_len = (
+                (self.accept_token / self.spec_num_forward_ct) if self.spec_num_forward_ct else 0.0
+            )
+            ret["speculative_stats"] = {
+                "algorithm": str(self.spec_algorithm.name),
+                "accept_token": int(self.accept_token),
+                "draft_token": int(self.draft_token),
+                "spec_num_forward_ct": int(self.spec_num_forward_ct),
+                "accept_ratio": float(accept_ratio),
+                "accept_len": float(accept_len),
+            }
 
         # state for pause/continue generation
         ret["engine_paused"] = self._engine_paused
@@ -811,7 +842,19 @@ class Scheduler(
             ret["req_to_token_pool_used"] = 0
 
         # physical kv cache stat
-        ret["available_kv_tokens"] = self.token_to_kv_pool_allocator.available_size()
+        try:
+            ret["available_kv_tokens"] = self.token_to_kv_pool_allocator.available_size()
+        except NotImplementedError:
+            # Some allocators (e.g. SWA hybrid) do not expose a single unified
+            # available_size(). Avoid crashing internal-state queries.
+            full = getattr(self.token_to_kv_pool_allocator, "full_available_size", None)
+            swa = getattr(self.token_to_kv_pool_allocator, "swa_available_size", None)
+            if callable(full) and callable(swa):
+                ret["available_kv_tokens_full"] = int(full())
+                ret["available_kv_tokens_swa"] = int(swa())
+                ret["available_kv_tokens"] = int(min(ret["available_kv_tokens_full"], ret["available_kv_tokens_swa"]))
+            else:
+                ret["available_kv_tokens"] = None
 
         # counters
         ret["num_generated_tokens"] = self.num_generated_tokens
@@ -1329,11 +1372,20 @@ class Scheduler(
             bid=bid,
             cache_miss_count=cache_miss_count,
         )
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            assert isinstance(batch_output.next_draft_input, EagleDraftInput)
-            ret.next_draft_input = batch_output.next_draft_input
-            ret.accept_lens = batch_output.accept_lens
-            ret.allocate_lens = batch_output.allocate_lens
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            if self.spec_algorithm.is_eagle():
+                from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+                assert isinstance(batch_output.next_draft_input, EagleDraftInput)
+                ret.next_draft_input = batch_output.next_draft_input
+                ret.accept_lens = batch_output.accept_lens
+                ret.allocate_lens = batch_output.allocate_lens
+            elif self.spec_algorithm.is_dflash():
+                from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
+                assert isinstance(batch_output.next_draft_input, DFlashDraftInput)
+                ret.next_draft_input = batch_output.next_draft_input
+                ret.accept_lens = batch_output.accept_lens
         return ret
 
     def process_batch_result(
@@ -1480,7 +1532,8 @@ def run_scheduler_process(
 
     # Config the process
     kill_itself_when_parent_died()
-    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
+    if setproctitle is not None:
+        setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
 

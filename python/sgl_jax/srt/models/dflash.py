@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from flax import nnx
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.speculative.dflash_utils import resolve_dflash_mask_token_id
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -181,10 +182,13 @@ class DFlashMLP(nnx.Module):
         if intermediate_size <= 0:
             raise ValueError(f"Invalid intermediate_size={intermediate_size} for DFLASH.")
 
+        dflash_cfg = _get_dflash_config(config)
+        mlp_bias = bool(dflash_cfg.get("mlp_bias", False))
+
         self.gate_up_proj = LinearBase(
             input_size=hidden_size,
             output_size=2 * intermediate_size,
-            use_bias=False,
+            use_bias=mlp_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
@@ -192,7 +196,7 @@ class DFlashMLP(nnx.Module):
         self.down_proj = LinearBase(
             input_size=intermediate_size,
             output_size=hidden_size,
-            use_bias=False,
+            use_bias=mlp_bias,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             mesh=mesh,
@@ -260,10 +264,13 @@ class DFlashDecoderLayer(nnx.Module):
 class DFlashDraftModel(nnx.Module):
     """DFLASH draft model for SGLang-JAX (TPU).
 
-    This intentionally keeps a token embedding + LM head so we can run it inside
-    the current SGLang-JAX runtime (which passes `input_ids`, not `input_embeds`).
-    For released DFLASH checkpoints (which omit embed/head), these weights can be
-    shared from the target model via `set_embed_and_head()`.
+    This keeps a token embedding + LM head so we can run it inside the current
+    SGLang-JAX runtime (which passes `input_ids`, not `input_embeds`).
+
+    NOTE: DFLASH draft checkpoints often omit embed/head weights (they are shared
+    from the target model). In sglang-jax we always share them at runtime via
+    `set_embed_and_head()`, and the weight loader intentionally does NOT require
+    embed/head tensors to exist in the draft checkpoint.
     """
 
     def __init__(
@@ -282,6 +289,20 @@ class DFlashDraftModel(nnx.Module):
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         dflash_cfg = _get_dflash_config(config)
+        self.mask_token_id = resolve_dflash_mask_token_id(draft_hf_config=config)
+        self.use_mask_embedding = bool(dflash_cfg.get("use_mask_embedding", False))
+        # Learned embedding used for masked positions (when enabled). This
+        # matches our EasyDeL TPU training checkpoints, which store the vector
+        # under `model/mask_embedding/value`.
+        self.mask_embedding = nnx.Param(
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (hidden_size,),
+                dtype=dtype,
+                out_sharding=jax.sharding.PartitionSpec(None),
+            )
+        )
+
         target_layer_ids = dflash_cfg.get("target_layer_ids", None)
         if target_layer_ids is None:
             self.num_context_features = num_layers
@@ -306,10 +327,11 @@ class DFlashDraftModel(nnx.Module):
         )
         self.norm = RMSNorm(hidden_size, epsilon=rms_norm_eps, param_dtype=dtype)
 
+        fc_bias = bool(dflash_cfg.get("fc_bias", False))
         self.fc = LinearBase(
             input_size=self.num_context_features * hidden_size,
             output_size=hidden_size,
-            use_bias=False,
+            use_bias=fc_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
@@ -345,6 +367,13 @@ class DFlashDraftModel(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        if self.use_mask_embedding:
+            mask = forward_batch.input_ids == int(self.mask_token_id)
+            hidden_states = jnp.where(
+                mask[:, None],
+                self.mask_embedding.value.astype(hidden_states.dtype),
+                hidden_states,
+            )
         residual = None
         layers_kv_fused = []
         layers_callback_flag = []
@@ -372,20 +401,19 @@ class DFlashDraftModel(nnx.Module):
         logger.info("DFLASH draft weights loaded successfully!")
 
     def _create_weight_mappings(self) -> dict[str, WeightMapping]:
+        dflash_cfg = _get_dflash_config(self.config)
+        fc_bias = bool(dflash_cfg.get("fc_bias", False))
+        mlp_bias = bool(dflash_cfg.get("mlp_bias", False))
+
         mappings: dict[str, WeightMapping] = {
-            "model.embed_tokens.weight": WeightMapping(
-                target_path="embed_tokens.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            ),
             "model.norm.weight": WeightMapping(
                 target_path="norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            "lm_head.weight": WeightMapping(
-                target_path="lm_head.embedding",
-                sharding=("tensor", None),
+            "model.mask_embedding": WeightMapping(
+                target_path="mask_embedding",
+                sharding=(None,),
                 transpose=False,
             ),
             # DFLASH projection weights
@@ -400,6 +428,12 @@ class DFlashDraftModel(nnx.Module):
                 transpose=False,
             ),
         }
+        if fc_bias:
+            mappings["model.fc.bias"] = WeightMapping(
+                target_path="fc.bias",
+                sharding=("tensor",),
+                transpose=False,
+            )
 
         for i in range(int(self.config.num_hidden_layers)):
             prefix = f"model.layers.{i}"
@@ -436,6 +470,16 @@ class DFlashDraftModel(nnx.Module):
                         sharding=("tensor", None),
                         transpose=True,
                     ),
+                    f"{prefix}.self_attn.q_norm.weight": WeightMapping(
+                        target_path=f"{target_prefix}.self_attn.q_norm.scale",
+                        sharding=(None,),
+                        transpose=False,
+                    ),
+                    f"{prefix}.self_attn.k_norm.weight": WeightMapping(
+                        target_path=f"{target_prefix}.self_attn.k_norm.scale",
+                        sharding=(None,),
+                        transpose=False,
+                    ),
                     f"{prefix}.mlp.gate_up_proj.weight": WeightMapping(
                         target_path=f"{target_prefix}.mlp.gate_up_proj.weight",
                         sharding=(None, "tensor"),
@@ -448,9 +492,49 @@ class DFlashDraftModel(nnx.Module):
                     ),
                 }
             )
+            if mlp_bias:
+                mappings.update(
+                    {
+                        f"{prefix}.mlp.gate_up_proj.bias": WeightMapping(
+                            target_path=f"{target_prefix}.mlp.gate_up_proj.bias",
+                            sharding=("tensor",),
+                            transpose=False,
+                        ),
+                        f"{prefix}.mlp.down_proj.bias": WeightMapping(
+                            target_path=f"{target_prefix}.mlp.down_proj.bias",
+                            sharding=(None,),
+                            transpose=False,
+                        ),
+                    }
+                )
+
+            if bool(getattr(self.config, "attention_bias", False)):
+                mappings.update(
+                    {
+                        f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                            target_path=f"{target_prefix}.self_attn.q_proj.bias",
+                            sharding=("tensor",),
+                            transpose=False,
+                        ),
+                        f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                            target_path=f"{target_prefix}.self_attn.k_proj.bias",
+                            sharding=("tensor",),
+                            transpose=False,
+                        ),
+                        f"{prefix}.self_attn.v_proj.bias": WeightMapping(
+                            target_path=f"{target_prefix}.self_attn.v_proj.bias",
+                            sharding=("tensor",),
+                            transpose=False,
+                        ),
+                        f"{prefix}.self_attn.o_proj.bias": WeightMapping(
+                            target_path=f"{target_prefix}.self_attn.o_proj.bias",
+                            sharding=(None,),
+                            transpose=False,
+                        ),
+                    }
+                )
 
         return mappings
 
 
 EntryClass = DFlashDraftModel
-

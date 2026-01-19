@@ -6,7 +6,6 @@ import os
 import jax
 import jax.numpy as jnp
 import numpy as np
-import qwix
 import yaml
 from flax import nnx
 
@@ -27,7 +26,20 @@ QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
 DEFAULT_NUM_PAGES = 100
 
 
-def parse_qwix_config_to_rules(qwix_config: list[dict]) -> list[qwix.QuantizationRule]:
+try:  # pragma: no cover
+    import qwix  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    qwix = None
+
+
+def _require_qwix() -> None:
+    if qwix is None:
+        raise ModuleNotFoundError(
+            "Qwix quantization requested, but optional dependency `qwix` is not installed."
+        )
+
+
+def parse_qwix_config_to_rules(qwix_config: list[dict]):
     """
     Parse a list of dictionaries containing Qwix quantization rules into a list of QuantizationRule objects.
 
@@ -37,6 +49,7 @@ def parse_qwix_config_to_rules(qwix_config: list[dict]) -> list[qwix.Quantizatio
     Returns:
         a list of QuantizationRule objects
     """
+    _require_qwix()
     rules = []
     for rule in qwix_config:
         rules.append(qwix.QuantizationRule(**rule))
@@ -74,6 +87,7 @@ def qwix_quantize_nnx_model(
     Returns:
         model: the quantized model
     """
+    _require_qwix()
 
     qwix_rules = parse_qwix_config_to_rules(qwix_config)
     model_input = {
@@ -127,6 +141,7 @@ def apply_qwix_quantization(
     Will apply quantization if a valid quantization config with Qwix rules is provided.  See README
     for more details on Qwix.
     """
+    _require_qwix()
 
     qwix_config_dict = quantization_config_file_path_to_dict(
         os.path.join(model_config.quantization_config_path)

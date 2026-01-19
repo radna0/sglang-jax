@@ -1049,6 +1049,11 @@ class ServerArgs:
                 raise ValueError("DFLASH currently requires --page-size 1.")
             if self.speculative_draft_model_path is None:
                 raise ValueError("DFLASH requires --speculative-draft-model-path.")
+            if not bool(self.disable_radix_cache):
+                raise ValueError(
+                    "DFLASH currently requires --disable-radix-cache in sglang-jax "
+                    "(draft KV materialization does not yet support prefix reuse)."
+                )
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

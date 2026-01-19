@@ -38,9 +38,11 @@ from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+from sgl_jax.srt.speculative.dflash_utils import resolve_dflash_target_layer_ids
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantization
+from transformers import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,30 @@ class ModelRunner:
         total_device_memory = self.get_available_device_memory()
         self.init_attention_backend()
         self.load_model()
+
+        # DFLASH must configure target hidden capture BEFORE JIT compilation.
+        # `initialize_jit()` closes over model_def, so mutating capture flags
+        # after JIT won't affect the compiled graph.
+        try:
+            if (
+                (not self.is_draft_worker)
+                and SpeculativeAlgorithm.from_string(getattr(server_args, "speculative_algorithm", None)).is_dflash()
+                and getattr(server_args, "speculative_draft_model_path", None)
+                and hasattr(self.model, "set_dflash_layers_to_capture")
+            ):
+                draft_cfg = AutoConfig.from_pretrained(
+                    server_args.speculative_draft_model_path,
+                    trust_remote_code=bool(getattr(server_args, "trust_remote_code", False)),
+                )
+                target_layer_ids = resolve_dflash_target_layer_ids(
+                    draft_hf_config=draft_cfg,
+                    target_num_layers=int(self.model_config.num_hidden_layers),
+                    default_num_context_features=int(getattr(draft_cfg, "num_hidden_layers", 0) or 0) or 4,
+                )
+                self.model.set_dflash_layers_to_capture(target_layer_ids)
+                logger.info("DFLASH target capture layers (pre-jit): %s", target_layer_ids)
+        except Exception as e:
+            logger.warning("DFLASH target capture setup failed (pre-jit): %s", e)
 
         # Check if the model is using hybrid SWA
         if (

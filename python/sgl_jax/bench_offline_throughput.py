@@ -254,6 +254,13 @@ def throughput_test_once(
     measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
         "last_gen_throughput"
     ]
+    spec_stats = server_info["internal_states"][0].get("speculative_stats")
+    if isinstance(spec_stats, dict):
+        measurement_results["spec_algorithm"] = spec_stats.get("algorithm")
+        measurement_results["spec_accept_ratio"] = spec_stats.get("accept_ratio")
+        measurement_results["spec_accept_len"] = spec_stats.get("accept_len")
+        measurement_results["spec_accept_token"] = spec_stats.get("accept_token")
+        measurement_results["spec_draft_token"] = spec_stats.get("draft_token")
 
     return measurement_results
 

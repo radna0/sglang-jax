@@ -411,14 +411,23 @@ class MHATokenToKVPool(KVCache):
         # Merge k and v into fused format
         fused_kv = merge_kv(k, v)  # [total_tokens, num_heads * 2, head_dim]
 
-        # Update the fused KV cache
-        self.kv_buffer[layer_idx] = _set_fused_kv_buffer(
-            fused_kv=fused_kv,
-            loc=loc,
-            kv_cache=self.kv_buffer[layer_idx],
-            page_size=page_size,
-            kv_partition_axis=self.kv_partition_axis,
-        )
+        # Update the fused KV cache. Some JAX versions require a mesh context
+        # for sharded updates (used by update_kv_cache kernels).
+        try:
+            ctx = jax.sharding.use_mesh(self.mesh)
+        except AttributeError:
+            try:
+                ctx = jax.set_mesh(self.mesh)
+            except AttributeError:
+                ctx = self.mesh
+        with ctx:
+            self.kv_buffer[layer_idx] = _set_fused_kv_buffer(
+                fused_kv=fused_kv,
+                loc=loc,
+                kv_cache=self.kv_buffer[layer_idx],
+                page_size=page_size,
+                kv_partition_axis=self.kv_partition_axis,
+            )
 
     def replace_kv_buffer(self, fused_kv_buffer: list[jnp.ndarray]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer

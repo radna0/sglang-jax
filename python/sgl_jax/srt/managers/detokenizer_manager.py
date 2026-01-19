@@ -8,7 +8,6 @@ import threading
 from collections import OrderedDict
 
 import psutil
-import setproctitle
 import zmq
 
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
@@ -26,6 +25,12 @@ from sgl_jax.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Cosmetic only; detokenizer works without it.
+try:  # pragma: no cover
+    import setproctitle  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    setproctitle = None
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
 # oldest request states will be evicted. Default: 65536 (1<<16).
@@ -309,7 +314,8 @@ def run_detokenizer_process(
     port_args: PortArgs,
 ):
     kill_itself_when_parent_died()
-    setproctitle.setproctitle("sglang-jax::detokenizer")
+    if setproctitle is not None:
+        setproctitle.setproctitle("sglang-jax::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 

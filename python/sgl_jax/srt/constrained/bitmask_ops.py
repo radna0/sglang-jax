@@ -1,9 +1,17 @@
 """JAX-based bitmask operations for vocabulary masking on TPU."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-from llguidance import LLInterpreter
+
+if TYPE_CHECKING:  # pragma: no cover
+    from llguidance import LLInterpreter
+else:
+    LLInterpreter = Any  # type: ignore[misc,assignment]
 
 
 def allocate_token_bitmask(batch_size: int, vocab_size: int) -> np.ndarray:

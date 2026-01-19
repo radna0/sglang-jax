@@ -21,6 +21,23 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
+def _choose_gmm_tm(m: int, *, max_tm: int = 512) -> int:
+    """Pick a megablox-GMM m tile size which divides `m`.
+
+    The TPU megablox GMM kernel requires `m % tm == 0`. Some callers used
+    `tm=min(512, m)`, which fails for common sizes (e.g. m=944). We pick the
+    largest power-of-two <= max_tm that divides m (falling back to 1).
+    """
+
+    m_int = int(m)
+    if m_int <= 0:
+        return 1
+    max_tm_int = int(max_tm)
+    for cand in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1):
+        if cand <= max_tm_int and cand <= m_int and (m_int % cand == 0):
+            return cand
+    return 1
+
 if TYPE_CHECKING:
     from sgl_jax.srt.configs.model_config import ModelConfig
 
@@ -213,13 +230,14 @@ class GptOssExperts(nnx.Module):
         expert_shard_id = jax.lax.axis_index("expert")
         group_offset = jnp.array(expert_shard_id * self.experts_per_device, dtype=jnp.int32)
 
+        tm = _choose_gmm_tm(int(sorted_inputs.shape[0]))
         gate_up = gmm(
             lhs=sorted_inputs,
             rhs=gate_up_proj,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
             tiling=(
-                min(512, sorted_inputs.shape[0]),
+                tm,
                 min(1024, sorted_inputs.shape[1]),
                 min(1024, gate_up_proj.shape[-1]),
             ),
@@ -235,13 +253,14 @@ class GptOssExperts(nnx.Module):
         glu = gate * jax.nn.sigmoid(gate * self.alpha)
         intermediate = (up + 1.0) * glu
 
+        tm = _choose_gmm_tm(int(intermediate.shape[0]))
         out = gmm(
             lhs=intermediate,
             rhs=down_proj,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
             tiling=(
-                min(512, intermediate.shape[0]),
+                tm,
                 min(1024, intermediate.shape[1]),
                 min(1024, down_proj.shape[-1]),
             ),
