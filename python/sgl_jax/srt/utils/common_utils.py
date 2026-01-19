@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import ctypes
 import dataclasses
+import faulthandler
 import functools
 import ipaddress
 import itertools
@@ -270,6 +271,11 @@ def pyspy_dump_schedulers():
         logger.error("Pyspy dump for PID %s:\n%s", pid, result.stdout)
     except subprocess.CalledProcessError as e:
         logger.error("Pyspy failed to dump PID %s. Error: %s", pid, e.stderr)
+        try:
+            logger.error("Falling back to faulthandler thread dump (all_threads=True).")
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
 
 
 def kill_itself_when_parent_died():
