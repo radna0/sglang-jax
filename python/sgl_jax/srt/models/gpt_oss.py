@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -212,6 +213,45 @@ class GptOssExperts(nnx.Module):
         down_proj: jax.Array,
         down_proj_bias: jax.Array,
     ) -> jax.Array:
+        use_gather_mm = os.environ.get("SGLANG_TPU_MOE_GATHER_MM", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+        gmm_interpret = os.environ.get("SGLANG_TPU_GMM_INTERPRET", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+
+        def _per_token_mm(
+            *,
+            x: jax.Array,  # [M, K]
+            w: jax.Array,  # [E, K, N]
+            b: jax.Array | None,  # [E, N] or None
+            expert_ids_global: jax.Array,  # [M]
+            group_offset: jax.Array,  # scalar int32
+            out_dtype: jnp.dtype,
+        ) -> jax.Array:
+            # Map global expert ids into local shard ids.
+            local_ids = (expert_ids_global - group_offset).astype(jnp.int32)
+            # Gather per-token weights: [M, K, N]
+            w_tok = w[local_ids]
+            # Batched matmul: [M, N]
+            y = jnp.einsum(
+                "mk,mkn->mn",
+                x.astype(jnp.float32),
+                w_tok.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            ).astype(out_dtype)
+            if b is not None:
+                y = y + b[local_ids].astype(out_dtype)
+            return y
+
         # NOTE: ep_size==1 in our current TPU setup (no expert-parallel token dispatch).
         if hidden_states.ndim == 2:
             inputs_2d = hidden_states
@@ -230,20 +270,31 @@ class GptOssExperts(nnx.Module):
         expert_shard_id = jax.lax.axis_index("expert")
         group_offset = jnp.array(expert_shard_id * self.experts_per_device, dtype=jnp.int32)
 
-        tm = _choose_gmm_tm(int(sorted_inputs.shape[0]))
-        gate_up = gmm(
-            lhs=sorted_inputs,
-            rhs=gate_up_proj,
-            group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
-            tiling=(
-                tm,
-                min(1024, sorted_inputs.shape[1]),
-                min(1024, gate_up_proj.shape[-1]),
-            ),
-            group_offset=group_offset,
-        )
-        gate_up = gate_up + gate_up_proj_bias[expert_ids]
+        if use_gather_mm:
+            gate_up = _per_token_mm(
+                x=sorted_inputs.astype(self.dtype),
+                w=gate_up_proj,
+                b=gate_up_proj_bias,
+                expert_ids_global=expert_ids,
+                group_offset=group_offset,
+                out_dtype=self.dtype,
+            )
+        else:
+            tm = _choose_gmm_tm(int(sorted_inputs.shape[0]))
+            gate_up = gmm(
+                lhs=sorted_inputs,
+                rhs=gate_up_proj,
+                group_sizes=group_sizes,
+                preferred_element_type=self.dtype,
+                tiling=(
+                    tm,
+                    min(1024, sorted_inputs.shape[1]),
+                    min(1024, gate_up_proj.shape[-1]),
+                ),
+                group_offset=group_offset,
+                interpret=gmm_interpret,
+            )
+            gate_up = gate_up + gate_up_proj_bias[expert_ids]
 
         gate = gate_up[..., ::2]
         up = gate_up[..., 1::2]
@@ -253,22 +304,34 @@ class GptOssExperts(nnx.Module):
         glu = gate * jax.nn.sigmoid(gate * self.alpha)
         intermediate = (up + 1.0) * glu
 
-        tm = _choose_gmm_tm(int(intermediate.shape[0]))
-        out = gmm(
-            lhs=intermediate,
-            rhs=down_proj,
-            group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
-            tiling=(
-                tm,
-                min(1024, intermediate.shape[1]),
-                min(1024, down_proj.shape[-1]),
-            ),
-            group_offset=group_offset,
-        )
+        if use_gather_mm:
+            out = _per_token_mm(
+                x=intermediate.astype(self.dtype),
+                w=down_proj,
+                b=down_proj_bias,
+                expert_ids_global=expert_ids,
+                group_offset=group_offset,
+                out_dtype=self.dtype,
+            )
+        else:
+            tm = _choose_gmm_tm(int(intermediate.shape[0]))
+            out = gmm(
+                lhs=intermediate,
+                rhs=down_proj,
+                group_sizes=group_sizes,
+                preferred_element_type=self.dtype,
+                tiling=(
+                    tm,
+                    min(1024, intermediate.shape[1]),
+                    min(1024, down_proj.shape[-1]),
+                ),
+                group_offset=group_offset,
+                interpret=gmm_interpret,
+            )
         if self.tp_size > 1:
             out = jax.lax.psum(out, "tensor")
-        out = out + down_proj_bias[expert_ids]
+        if not use_gather_mm:
+            out = out + down_proj_bias[expert_ids]
 
         argsort_indices = jnp.argsort(sorted_selected_experts, stable=True)
         unsort_out = jnp.take(out, indices=argsort_indices, axis=0)
@@ -453,8 +516,19 @@ class GptOssDecoderLayer(nnx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        topk_weights, topk_ids = self.router(hidden_states)
-        hidden_states = self.experts(hidden_states, topk_weights, topk_ids)
+        if os.environ.get("SGLANG_GPT_OSS_DISABLE_MOE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        ):
+            # Debug knob: bypass MoE to isolate TPU hangs. This will harm quality
+            # but keeps attention/KV behavior intact.
+            pass
+        else:
+            topk_weights, topk_ids = self.router(hidden_states)
+            hidden_states = self.experts(hidden_states, topk_weights, topk_ids)
 
         return hidden_states, residual, kv_fused
 

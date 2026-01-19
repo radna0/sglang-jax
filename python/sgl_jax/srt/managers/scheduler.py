@@ -1289,6 +1289,24 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
 
+        if os.environ.get("SGLANG_DEBUG_FORWARD_PROGRESS", "0").lower() in ("1", "true", "yes", "y", "on"):
+            try:
+                interval = int(os.environ.get("SGLANG_DEBUG_FORWARD_PROGRESS_EVERY", "50"))
+            except Exception:
+                interval = 50
+            if interval > 0 and (self.forward_ct % interval) == 0:
+                try:
+                    max_seq = int(np.max(batch.seq_lens)) if batch.seq_lens is not None else -1
+                except Exception:
+                    max_seq = -1
+                logger.info(
+                    "[progress] forward_ct=%s mode=%s bs=%s max_seq_len=%s",
+                    int(self.forward_ct),
+                    str(batch.forward_mode),
+                    len(batch.reqs),
+                    max_seq,
+                )
+
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
 
