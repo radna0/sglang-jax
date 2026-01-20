@@ -263,6 +263,11 @@ def nullable_str(val: str):
 
 def pyspy_dump_schedulers():
     """py-spy dump on all scheduler in a local node."""
+    # py-spy requires ptrace permissions that are often disabled on managed TPU
+    # hosts. Since this is only a debugging aid, keep it opt-in to avoid noisy
+    # logs (and occasional watchdog churn) on production runs.
+    if os.environ.get("SGLANG_JAX_ENABLE_PYSPY", "0").lower() not in ("1", "true", "yes", "y"):
+        return
     try:
         pid = psutil.Process().pid
         # Command to run py-spy with the PID

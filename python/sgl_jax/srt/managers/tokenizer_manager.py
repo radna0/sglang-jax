@@ -878,7 +878,14 @@ class TokenizerManager:
 
         # Drain requests
         while True:
-            remain_num_req = len(self.rid_to_state)
+            # `rid_to_state` can retain finished requests (e.g., for logging /
+            # debugging). For graceful shutdown we only care about unfinished
+            # work; otherwise SIGTERM can hang indefinitely with
+            # "remaining number of requests" never reaching 0.
+            remain_num_req = 0
+            for state in self.rid_to_state.values():
+                if not getattr(state, "finished", False):
+                    remain_num_req += 1
 
             if self.health_check_failed:
                 # if health check failed, we should exit immediately
